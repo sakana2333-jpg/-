@@ -1401,9 +1401,18 @@ export async function generateCustomAppImage(app: InstalledCustomApp, record: Re
   const userReferenceImageRef = record.userReferenceImageRef ?? record.userReferenceImage ?? record.userImageRef;
   const appUserReferenceImage = await resolveOwnedCustomAppUserReferenceImage(app, userReferenceImageRef);
   const timeoutMs = optionalCustomAppTimeoutMs(record.timeoutMs);
-  const result = await withOptionalCustomAppTimeout(timeoutMs, "ai.generateImage", signal => (
-    generateImageFromConfiguredApi({ description, characterId, useReferenceImage, appUserReferenceImage, signal })
-  ));
+  let result: Awaited<ReturnType<typeof generateImageFromConfiguredApi>>;
+  try {
+    result = await withOptionalCustomAppTimeout(timeoutMs, "ai.generateImage", signal => (
+      generateImageFromConfiguredApi({ description, characterId, useReferenceImage, appUserReferenceImage, signal })
+    ));
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    if (typeof window !== "undefined") {
+      window.alert(`生图请求失败: ${errMsg}`);
+    }
+    throw err;
+  }
   if (!result) throw new Error("生图功能未配置或未启用，请先在小手机设置里配置生图 API。");
   return {
     ok: true,
