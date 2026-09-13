@@ -1069,6 +1069,8 @@ export function CustomAppRunner({
 
     if (action === "app.getManifest") return app.manifest;
     if (action === "app.getCapabilities") {
+      const imgSettings = loadImageGenerationSettings();
+      const hasHostImageApi = Boolean(imgSettings.enabled && ((imgSettings.apiKey && imgSettings.baseUrl) || (imgSettings.provider === "novelai" && imgSettings.novelai?.apiKey)));
       return {
         sdkVersion: app.manifest.sdkVersion || "1.0",
         permissions: app.permissions,
@@ -1078,7 +1080,12 @@ export function CustomAppRunner({
         events: app.manifest.extensions?.events ?? app.manifest.events ?? [],
         network: app.manifest.network ?? {},
         imageGeneration: {
+          enabled: hasHostImageApi,
+          configured: hasHostImageApi,
           userReferenceImage: true,
+        },
+        features: {
+          imageGeneration: hasHostImageApi,
         },
         sdk: {
           app: ["getManifest", "getCapabilities", "getLaunchContext", "getAssetUrl", "close"],
