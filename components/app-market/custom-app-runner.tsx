@@ -1077,6 +1077,9 @@ export function CustomAppRunner({
         promptProfiles: app.manifest.extensions?.prompt?.profiles ?? app.manifest.promptProfiles ?? [],
         events: app.manifest.extensions?.events ?? app.manifest.events ?? [],
         network: app.manifest.network ?? {},
+        imageGeneration: {
+          userReferenceImage: true,
+        },
         sdk: {
           app: ["getManifest", "getCapabilities", "getLaunchContext", "getAssetUrl", "close"],
           ai: ["generate", "generateImage", "chat", "embed", "classify"],
