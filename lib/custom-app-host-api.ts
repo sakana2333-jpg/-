@@ -63,7 +63,9 @@ import {
 } from "./settings-storage";
 import type { ApiConfig, VoiceApiConfig, WorldBookConfig, WorldBookEntry } from "./settings-types";
 import { createSTTSession } from "./stt-service";
-import { generateImageFromConfiguredApi } from "./image-generation-service";
+import { generateImageFromConfiguredApi, type AppUserReferenceImage } from "./image-generation-service";
+import { loadMediaBlob } from "./media-cache-storage";
+import { validateOwnedAppImageReference } from "./image-generation-reference-policy";
 import { getThemeAssetDataUrl, saveThemeAssetFromBlob } from "./theme-storage";
 import type { ThemeAssetType } from "./theme-types";
 import { synthesizeSpeech } from "./tts-service";
@@ -1366,14 +1368,41 @@ export async function runCustomAppAiClassify(app: InstalledCustomApp, record: Re
   return { label, raw };
 }
 
+const CUSTOM_APP_MEDIA_REFS_COLLECTION = "__media_refs";
+const CUSTOM_APP_IMAGE_REFERENCE_MAX_BYTES = 25 * 1024 * 1024;
+
+async function resolveOwnedCustomAppUserReferenceImage(
+  app: InstalledCustomApp,
+  refValue: unknown,
+): Promise<AppUserReferenceImage | undefined> {
+  const rawRef = cleanText(refValue, 240);
+  if (!rawRef) return undefined;
+  const ownedRows = readCustomAppCollection(app.id, CUSTOM_APP_MEDIA_REFS_COLLECTION);
+  if (!rawRef.startsWith("media-store://")) {
+    throw new Error("App 用户参考图必须是 media-store:// 引用。");
+  }
+  const media = await loadMediaBlob(rawRef);
+  validateOwnedAppImageReference({
+    ref: rawRef,
+    ownedRows,
+    media: media ? { category: media.category, mimeType: media.mimeType, bytes: media.blob.size } : null,
+    maxBytes: CUSTOM_APP_IMAGE_REFERENCE_MAX_BYTES,
+  });
+  if (!media) return undefined;
+  const dataUrl = await blobToDataUrl(media.blob);
+  return { dataUrl, mimeType: media.mimeType };
+}
+
 export async function generateCustomAppImage(app: InstalledCustomApp, record: Record<string, unknown>): Promise<Record<string, unknown>> {
   const description = cleanText(record.prompt ?? record.description, 4000);
   if (!description) throw new Error("ai.generateImage 需要 prompt。");
   const characterId = cleanText(record.characterId, 160) || undefined;
   const useReferenceImage = record.useReferenceImage === true;
+  const userReferenceImageRef = record.userReferenceImageRef ?? record.userReferenceImage ?? record.userImageRef;
+  const appUserReferenceImage = await resolveOwnedCustomAppUserReferenceImage(app, userReferenceImageRef);
   const timeoutMs = optionalCustomAppTimeoutMs(record.timeoutMs);
   const result = await withOptionalCustomAppTimeout(timeoutMs, "ai.generateImage", signal => (
-    generateImageFromConfiguredApi({ description, characterId, useReferenceImage, signal })
+    generateImageFromConfiguredApi({ description, characterId, useReferenceImage, appUserReferenceImage, signal })
   ));
   if (!result) throw new Error("生图功能未配置或未启用，请先在小手机设置里配置生图 API。");
   return {
@@ -1383,6 +1412,11 @@ export async function generateCustomAppImage(app: InstalledCustomApp, record: Re
     prompt: result.prompt,
     revisedPrompt: result.revisedPrompt,
     usedReferenceImage: result.usedReferenceImage,
+    usedCharacterReferenceImage: result.usedCharacterReferenceImage,
+    usedUserReferenceImage: result.usedUserReferenceImage,
+    userReferenceImageRequested: result.userReferenceImageRequested,
+    userReferenceImageStatus: result.userReferenceImageStatus,
+    userReferenceImageMessage: result.userReferenceImageMessage,
   };
 }
 

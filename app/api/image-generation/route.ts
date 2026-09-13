@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { ProxyAgent, type Dispatcher } from "undici";
 import JSZip from "jszip";
+import { redactImageGenerationError } from "@/lib/image-generation-reference-policy";
 import {
   NOVELAI_DEFAULT_MODEL,
   getNovelAiResolution,
@@ -25,6 +26,7 @@ type ImageGenerationRequest = {
   size?: string;
   quality?: string;
   referenceImageDataUrl?: string;
+  referenceImageDataUrls?: string[];
   // NovelAI 专属参数
   negativePrompt?: string;
   steps?: number;
@@ -344,7 +346,7 @@ async function runImageGeneration(input: ImageGenerationRequest): Promise<{ stat
     const contentType = (res.headers.get("content-type") || "").toLowerCase();
     if (!res.ok) {
       const errText = await res.text().catch(() => "");
-      return { status: 502, body: { error: `生图 API 错误 ${res.status}: ${errText.slice(0, 600)}` } };
+      return { status: 502, body: { error: redactImageGenerationError(`生图 API 错误 ${res.status}: ${errText.slice(0, 600)}`) } };
     }
 
     if (contentType.startsWith("image/")) {
@@ -374,7 +376,7 @@ async function runImageGeneration(input: ImageGenerationRequest): Promise<{ stat
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     const status = message.toLowerCase().includes("abort") ? 504 : 502;
-    return { status, body: { error: message } };
+    return { status, body: { error: redactImageGenerationError(message) } };
   }
 }
 
@@ -408,7 +410,7 @@ export async function POST(req: NextRequest) {
           .catch((err) => {
             const message = err instanceof Error ? err.message : String(err);
             try {
-              controller.enqueue(encoder.encode("\n" + IMAGE_STREAM_RESULT_MARKER + JSON.stringify({ httpStatus: 502, error: message })));
+              controller.enqueue(encoder.encode("\n" + IMAGE_STREAM_RESULT_MARKER + JSON.stringify({ httpStatus: 502, error: redactImageGenerationError(message) })));
             } catch { /* 流已关闭 */ }
           })
           .finally(() => {
