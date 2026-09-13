@@ -760,7 +760,8 @@ export async function generateImageFromConfiguredApi(params: {
   const description = params.description.trim();
   if (!description) return null;
 
-  const userReferenceRequested = Boolean(params.appUserReferenceImage?.dataUrl);
+  const userReferenceImageRequested = Boolean(params.appUserReferenceImage?.dataUrl);
+  const userReferenceRequested = userReferenceImageRequested;
   let userReferenceImageStatus: UserReferenceImageStatus = userReferenceRequested ? "used" : "not_requested";
   let userReferenceImageMessage: string | undefined;
 
