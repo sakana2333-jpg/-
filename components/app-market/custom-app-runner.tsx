@@ -1714,8 +1714,17 @@ export function CustomAppRunner({
         : generateCustomAppText(app, { ...launchRecord, ...record });
     }
     if (action === "ai.generateImage") {
-      requirePermission("ai.generateImage");
-      return generateCustomAppImage(app, { ...launchRecord, ...record });
+      if (!hasPermission(app, "ai.generateImage")) {
+        if (typeof window !== "undefined") window.alert(`[调试拦截] 时光相册未声明权限: ai.generateImage，请检查 manifest`);
+        throw new Error("应用未声明权限：ai.generateImage");
+      }
+      try {
+        return await generateCustomAppImage(app, { ...launchRecord, ...record });
+      } catch (e) {
+        const m = e instanceof Error ? e.message : String(e);
+        if (typeof window !== "undefined") window.alert(`[生成异常拦截]: ${m}`);
+        throw e;
+      }
     }
     if (action === "ai.chat") {
       requirePermission("ai.chat");
