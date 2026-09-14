@@ -825,8 +825,9 @@ export async function generateImageFromConfiguredApi(params: {
     if (modelPolicy.canAttemptImageInput) {
       userReferenceImageDataUrl = await normalizeReferenceImageForEdit(params.appUserReferenceImage.dataUrl);
     } else {
+      console.warn("[ImageGenPolicy] 模型策略拦截 userReferenceImage:", { model: settings.model, policy: modelPolicy });
       userReferenceImageStatus = "fallback_prompt";
-      userReferenceImageMessage = "当前模型不支持 App 用户参考图，已使用提示词生成。";
+      userReferenceImageMessage = `当前模型 (${settings.model}) 不支持 App 用户参考图，已使用提示词生成。`;
     }
   }
   throwIfAborted(params.signal);
@@ -843,9 +844,11 @@ export async function generateImageFromConfiguredApi(params: {
       ? await generateImageDirect({ settings, prompt, referenceImageDataUrls: finalReferenceUrls, signal: params.signal })
       : await generateImageViaServerOrProxy({ settings, prompt, referenceImageDataUrls: finalReferenceUrls, signal: params.signal });
   } catch (error) {
+    const errStr = error instanceof Error ? error.message : String(error ?? "");
+    console.error("[ImageGenError] 带用户参考图请求失败:", errStr);
     if (userReferenceRequested && usedUserReferenceImage && isReferenceInputUnsupportedError(error)) {
       userReferenceImageStatus = "fallback_prompt";
-      userReferenceImageMessage = "当前服务商未接受 App 用户参考图，已使用提示词生成。";
+      userReferenceImageMessage = `当前服务商未接受 App 用户参考图 (${errStr})，已使用提示词生成。`;
       usedUserReferenceImage = false;
       finalReferenceUrls = [characterReferenceImageDataUrl].filter(Boolean) as string[];
       data = settings.requestMode === "direct"

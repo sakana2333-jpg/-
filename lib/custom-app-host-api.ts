@@ -1414,6 +1414,11 @@ export async function generateCustomAppImage(app: InstalledCustomApp, record: Re
     throw err;
   }
   if (!result) throw new Error("生图功能未配置或未启用，请先在小手机设置里配置生图 API。");
+  if (result.userReferenceImageRequested && result.userReferenceImageStatus === "fallback_prompt") {
+    if (typeof window !== "undefined") {
+      window.alert(`【参考图未生效原因】\n${result.userReferenceImageMessage || "未知原因降级"}`);
+    }
+  }
   return {
     ok: true,
     dataUrl: result.dataUrl,
