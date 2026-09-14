@@ -326,10 +326,19 @@ export function UserProfilePanel({ onClose, className }: UserProfilePanelProps) 
                     <div className="flex items-center gap-5 px-6 pt-2 pb-4">
                         {/* Avatar */}
                         <div className="relative shrink-0">
-                            <div className="w-[84px] h-[84px] rounded-full overflow-hidden bg-[var(--c-card)] border-2 border-white/50 shadow-sm flex items-center justify-center relative"
-                                 style={{ boxShadow: "0 4px 20px rgba(0,0,0,0.06)" }}>
+                            <div className="w-[84px] h-[84px] rounded-full overflow-hidden bg-[var(--c-card)] border-2 border-white/50 shadow-sm flex items-center justify-center relative shrink-0"
+                                 style={{
+                                     boxShadow: "0 4px 20px rgba(0,0,0,0.06)",
+                                     transform: "translateZ(0)",
+                                     WebkitMaskImage: "-webkit-radial-gradient(white, black)",
+                                 }}>
                                 {identity?.avatarUrl ? (
-                                    <img src={identity.avatarUrl} alt="User Avatar" className="w-full h-full object-cover" />
+                                    <img
+                                        src={identity.avatarUrl}
+                                        alt="User Avatar"
+                                        className="w-full h-full object-cover select-none pointer-events-none"
+                                        style={{ WebkitBackfaceVisibility: "hidden" }}
+                                    />
                                 ) : (
                                     <User size={38} color="var(--c-icon)" />
                                 )}
