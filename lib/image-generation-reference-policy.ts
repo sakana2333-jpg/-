@@ -17,7 +17,10 @@ export function getUserReferenceImagePolicy(model: string): UserReferenceImagePo
   const compact = normalizedModel.replace(/-/g, "");
   const supported = normalizedModel === "gpt-image-2"
     || compact === "gptimage2"
-    || normalizedModel === "chatgpt-image-2";
+    || normalizedModel === "chatgpt-image-2"
+    || normalizedModel === "gpt-image-2-5"
+    || compact === "gptimage25"
+    || normalizedModel.includes("gemini-3.1-flash-image");
   return supported
     ? { canAttemptImageInput: true, normalizedModel }
     : { canAttemptImageInput: false, normalizedModel, reason: "model_not_supported" };
