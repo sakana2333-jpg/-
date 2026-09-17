@@ -19,12 +19,62 @@ import { buildCalendarScheduleMarker, getCurrentCalendarScheduleForPrompt } from
 import { getWeekStartIso } from "./calendar-utils";
 import { parseStoryResponse } from "./story-parser";
 import { STORY_PARSER_VERSION } from "./story-parser";
-import { loadStoryMessages, replaceStoryMessages, type StoryMessage } from "./story-storage";
+import { loadStoryMessages, replaceStoryMessages, resolveActiveStorySchemes, type StoryCharacterSettings, type StoryMessage } from "./story-storage";
 import type { ChatMessage } from "./chat-storage";
 import { MacroEngine } from "./macro-engine";
 
-const DEFAULT_STORY_FOLD_TAGS = "think,thinking,summary";
-const DEFAULT_STORY_CONTEXT_EXCLUDED_TAGS = "think,thinking";
+const DEFAULT_STORY_FOLD_TAGS = "think,thinking,summary,story_status,story_theater";
+const DEFAULT_STORY_CONTEXT_EXCLUDED_TAGS = "think,thinking,story_theater";
+const STORY_VOICE_FORMAT_PROMPT = `# 剧情正文格式
+请使用与“独家特调”一致的正文语义格式：
+- 「对白」：仅包裹角色真正说出口的人声；每次说话分别包裹，不要在括号内重复角色名。
+- *心声*：包裹角色没有说出口的内心想法。
+- 【场景】：单独一行，用于地点、时间或场景过场。
+- ~强调~：只强调需要突出的短语。
+- “……”：只用于物品、动作、环境等非人声发出的声音，不作为角色对白。
+- 对白标点唯一格式：无论用户或历史消息里的对话使用什么标点形式（“”、""、『』、''等），你输出的角色对白一律使用「」，不要模仿用户的标点。
+旁白、动作以及用户的话不得写进「」；不要解释这些格式，也不要输出额外的语音清单。`;
+
+export type StoryGenerationOptions = {
+  sessionFoldTags?: string;
+  sessionContextExcludedTags?: string;
+  settings?: StoryCharacterSettings;
+  floatingChatContext?: string;
+  signal?: AbortSignal;
+};
+
+function selectStoryPresetPrompts(preset: PresetConfig | null, selectedIds?: string[]): PresetConfig | null {
+  if (!preset || selectedIds === undefined) return preset;
+  const allowed = new Set(selectedIds);
+  return {
+    ...preset,
+    prompts: preset.prompts.map((prompt) => prompt.marker ? prompt : { ...prompt, enabled: prompt.enabled && allowed.has(prompt.identifier) }),
+    prompt_order: preset.prompt_order,
+  };
+}
+
+function buildStorySettingsPrompt(settings: StoryCharacterSettings | undefined, userName: string): string {
+  if (!settings) return "";
+  const minChars = Math.max(50, Math.min(4000, settings.minChars ?? 800));
+  const maxChars = Math.max(minChars, Math.min(4000, settings.maxChars ?? 1500));
+  const perspective = settings.userPerspective === "third"
+    ? "使用第三人称“TA”称呼用户"
+    : settings.userPerspective === "username"
+      ? `使用用户名“${userName}”称呼用户`
+      : "使用第二人称“你”称呼用户";
+  const { proseStyle, status, theater } = resolveActiveStorySchemes(settings);
+  return [
+    "# 当前剧情 APP 专属生成设置",
+    `正文长度以 ${minChars}—${maxChars} 字为目标；不得为了凑字数重复内容。`,
+    perspective + "。",
+    proseStyle?.prompt?.trim() ? `正文文风方案【${proseStyle.name}】（仅约束写作风格，不是尾部输出格式）：${proseStyle.prompt.trim()}` : (settings.proseStyle ? `文风：${settings.proseStyle}。` : ""),
+    proseStyle?.prompt?.trim() ? "" : (settings.proseStylePrompt?.trim() || ""),
+    settings.extraPrompt?.trim() || "",
+    ...(settings.customPromptEntries || []).filter((item) => item.enabled && item.content.trim()).map((item) => `专属条目【${item.name || "未命名"}】：${item.content.trim()}`),
+    status?.prompt?.trim() || "",
+    theater?.prompt?.trim() || "",
+  ].filter(Boolean).join("\n");
+}
 
 export type StoryGenerationResult = {
   rawText: string;
@@ -136,17 +186,18 @@ export function getStoryRenderSignature(characterId: string): { regexSignature: 
 export async function generateStoryCompletion(
   characterId: string,
   history: StoryMessage[],
-  options?: { sessionFoldTags?: string; sessionContextExcludedTags?: string; signal?: AbortSignal },
+  options?: StoryGenerationOptions,
 ): Promise<StoryGenerationResult> {
   const character = loadCharacters().find((item) => item.id === characterId);
   if (!character) {
     throw new ChatEngineError(`Character not found: ${characterId}`);
   }
 
-  const { apiConfig, preset, regexes, worldBooks, regexSignature, summaryTag } = resolveStoryConfigs(characterId);
+  const { apiConfig, preset: resolvedPreset, regexes, worldBooks, regexSignature, summaryTag } = resolveStoryConfigs(characterId);
+  const preset = selectStoryPresetPrompts(resolvedPreset, options?.settings?.enabledPresetPromptIds);
   const effectiveFoldTags = options?.sessionFoldTags?.trim() || DEFAULT_STORY_FOLD_TAGS;
   const effectiveContextExcludedTags = options?.sessionContextExcludedTags?.trim() || DEFAULT_STORY_CONTEXT_EXCLUDED_TAGS;
-  const llmMessages = await buildStoryPromptMessages(characterId, history, preset, regexes, worldBooks, effectiveContextExcludedTags);
+  const llmMessages = await buildStoryPromptMessages(characterId, history, preset, regexes, worldBooks, effectiveContextExcludedTags, options?.settings, options?.floatingChatContext);
 
   const userIdentity = resolveUserIdentity(characterId, "story");
   const macroEngine = new MacroEngine(character.name, userIdentity?.name ?? "用户");
@@ -217,6 +268,13 @@ async function buildStoryPromptMessages(
     recentBlocks,
     unifiedRecentItems,
   });
+  const settingsPrompt = buildStorySettingsPrompt(settings, userIdentity?.name ?? "用户");
+  if (settingsPrompt) messages.push({ role: "system", content: settingsPrompt });
+  if (settings?.floatingPhoneInContext && floatingChatContext?.trim()) {
+    messages.push({ role: "system", content: `# 悬浮小手机最近线上聊天\n以下记录用于衔接线上与线下剧情，不要逐字复述：\n${floatingChatContext.trim()}` });
+  }
+  messages.push({ role: "system", content: STORY_VOICE_FORMAT_PROMPT });
+  return messages;
 }
 
 export async function previewStoryPromptPayload(
