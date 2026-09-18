@@ -35,13 +35,23 @@ function SolidBackIcon({ size = 17 }: { size?: number }) {
     </svg>
   );
 }
+
+function MiniPhoneIcon({ size = 18 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <rect x="6.5" y="2.5" width="11" height="19" rx="2.6" stroke="currentColor" strokeWidth="1.8" />
+      <path d="M10 5h4M10.7 18.6h2.6" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
+    </svg>
+  );
+}
 import CSSSchemeBar from "@/components/ui/css-scheme-picker";
 import { Avatar } from "@/components/ui/primitives";
-import { StoryHtmlRenderer } from "@/components/ui/story-html-renderer";
+import { StoryHtmlRenderer, type StoryVoiceSegment } from "@/components/ui/story-html-renderer";
+import { StorySettingsPage, STORY_DEFAULT_STATUS_RENDER, STORY_DEFAULT_THEATER_RENDER } from "@/components/story/story-settings-page";
 import { loadCharacters } from "@/lib/character-storage";
 import { maybeRunSummarization } from "@/lib/memory-summarizer";
 import { incrementEventCounter } from "@/lib/memory-storage";
-import { resolveUserIdentity } from "@/lib/settings-storage";
+import { loadBindingConfig, loadPresets, resolveBinding, resolveUserIdentity } from "@/lib/settings-storage";
 import {
   generateStoryCompletion,
   getStoryRenderSignature,
@@ -52,18 +62,35 @@ import {
   hydrateStoryStorage,
   loadStoryMessages,
   loadStorySessions,
+  loadStorySchemeRepository,
   pushStoryMessage,
+  resolveActiveQuickInputScheme,
+  saveStorySchemeRepository,
+  STORY_DEFAULT_QUICK_INPUT_OPTIONS,
+  STORY_SCHEME_REPO_EVENT,
   deleteStoryMessage,
   deleteStoryMessagesFrom,
   editStoryMessage,
   type StoryMessage,
+  type StorySchemeRepository,
   type StorySession,
   updateStorySession,
+  type StoryCharacterSettings,
 } from "@/lib/story-storage";
+import { createOrGetSession, hydrateChatStorage, loadChatMessages, loadChatSessions, markChatSessionRead, pushChatMessage } from "@/lib/chat-storage";
+import { flattenCompletionResult, generateChatCompletion } from "@/lib/chat-engine";
+import { parseAIResponse } from "@/lib/rich-message-parser";
 import { SessionCustomCSS } from "@/components/ui/session-custom-css";
 import { STORY_CSS_EXAMPLE } from "@/lib/css-examples";
 import { applyEditOutputRegex } from "@/lib/llm-prompt-assembler";
 import { MacroEngine } from "@/lib/macro-engine";
+import { kvGet, kvSet, registerKvMigration } from "@/lib/kv-db";
+import {
+  playAudioBlobViaMediaElement,
+  resolveVoiceConfig,
+  synthesizeSpeech,
+  unlockAudioPlayback,
+} from "@/lib/tts-service";
 
 type StoryAppProps = {
   onClose: () => void;
@@ -75,6 +102,22 @@ type StoryGenerationRun = {
 };
 
 const activeStoryGenerationRuns = new Map<string, StoryGenerationRun>();
+const storyVoiceCache = new Map<string, Blob>();
+const STORY_VOICE_CACHE_LIMIT = 24;
+const STORY_ACTIVE_CHARACTER_KEY = "story-last-active-character-id";
+const DEFAULT_AUTO_READING_SPEED = 36;
+
+registerKvMigration(STORY_ACTIVE_CHARACTER_KEY);
+
+function cacheStoryVoice(key: string, blob: Blob) {
+  if (storyVoiceCache.has(key)) storyVoiceCache.delete(key);
+  storyVoiceCache.set(key, blob);
+  while (storyVoiceCache.size > STORY_VOICE_CACHE_LIMIT) {
+    const oldest = storyVoiceCache.keys().next().value;
+    if (!oldest) break;
+    storyVoiceCache.delete(oldest);
+  }
+}
 
 function createStoryGenerationRun(sessionId: string): StoryGenerationRun {
   activeStoryGenerationRuns.get(sessionId)?.controller.abort();
@@ -195,21 +238,78 @@ function StoryGeneratingIndicator({
 }
 
 const StoryComposer = memo(function StoryComposer({
-  characterName,
   isGenerating,
   appendRequest,
+  voiceEnabled,
+  voicePlaying,
+  voiceProgress,
   onSend,
+  onContinue,
+  autoReadingEnabled,
+  autoReading,
+  currentReadExpanded,
+  canAutoRead,
+  onToggleAutoReading,
+  onCurrentReadControl,
   onStop,
+  onPlayNext,
+  quickInputEnabled,
+  quickInputOptions,
+  quickInputCursor,
 }: {
-  characterName: string;
   isGenerating: boolean;
   appendRequest: StoryComposerAppendRequest | null;
+  voiceEnabled: boolean;
+  voicePlaying: boolean;
+  voiceProgress: { current: number; total: number };
   onSend: (text: string) => void;
+  onContinue: () => void;
+  autoReadingEnabled: boolean;
+  autoReading: boolean;
+  currentReadExpanded: boolean;
+  canAutoRead: boolean;
+  onToggleAutoReading: () => void;
+  onCurrentReadControl: () => void;
   onStop: () => void;
+  onPlayNext: () => void;
+  quickInputEnabled: boolean;
+  quickInputOptions: string[];
+  quickInputCursor: "left" | "middle" | "right";
 }) {
   const [draft, setDraft] = useState("");
+  const [quickPanelOpen, setQuickPanelOpen] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const lastAppendIdRef = useRef<number | null>(null);
+  // 记录输入框最近一次选区/光标：点快捷选项时按钮会抢走焦点，
+  // 这时 selectionStart 已经不可靠，用这个 ref 兜底
+  const lastSelectionRef = useRef<{ start: number; end: number } | null>(null);
+
+  const rememberSelection = (el: HTMLTextAreaElement) => {
+    lastSelectionRef.current = { start: el.selectionStart, end: el.selectionEnd };
+  };
+
+  const insertQuickOption = (option: string) => {
+    const sel = lastSelectionRef.current;
+    const start = Math.min(sel ? sel.start : draft.length, draft.length);
+    const end = Math.max(start, Math.min(sel ? sel.end : draft.length, draft.length));
+    const nextDraft = draft.slice(0, start) + option + draft.slice(end);
+    // 光标落点：左边=插入内容之前；中间=成对符号正中（单字符视作末尾）；右边=插入内容之后
+    const caretOffset = quickInputCursor === "left"
+      ? 0
+      : quickInputCursor === "right"
+        ? option.length
+        : Math.ceil(option.length / 2);
+    const caret = start + caretOffset;
+    setDraft(nextDraft);
+    lastSelectionRef.current = { start: caret, end: caret };
+    requestAnimationFrame(() => {
+      const textarea = textareaRef.current;
+      if (!textarea) return;
+      resizeStoryComposerTextarea(textarea);
+      textarea.focus({ preventScroll: true });
+      textarea.setSelectionRange(caret, caret);
+    });
+  };
 
   useEffect(() => {
     if (!appendRequest || appendRequest.id === lastAppendIdRef.current) return;
@@ -239,14 +339,92 @@ const StoryComposer = memo(function StoryComposer({
   };
 
   return (
-    <div className="story-composer">
+    <div className="story-composer" data-quick-input={quickInputEnabled ? "true" : undefined}>
+      {quickInputEnabled && quickPanelOpen && quickInputOptions.length > 0 ? (
+        <div className="story-quick-panel" role="toolbar" aria-label="快捷输入面板">
+          {quickInputOptions.map((option, index) => (
+            <button
+              key={`${index}-${option}`}
+              type="button"
+              className="story-quick-chip"
+              onClick={() => insertQuickOption(option)}
+            >
+              {option}
+            </button>
+          ))}
+        </div>
+      ) : null}
+      <button
+        type="button"
+        className="story-sequence-play"
+        data-enabled={voiceEnabled ? "true" : undefined}
+        data-playing={voicePlaying ? "true" : undefined}
+        onClick={onPlayNext}
+        disabled={voicePlaying}
+        aria-label="播放下一句角色对白"
+        title="播放下一句"
+      >
+        <span aria-hidden="true">{voicePlaying ? "…" : "▶"}</span>
+        {voiceProgress.total > 0 ? (
+          <small>{voiceProgress.current}/{voiceProgress.total}</small>
+        ) : null}
+      </button>
+      <button
+        type="button"
+        className="story-continue-btn"
+        onClick={onContinue}
+        disabled={isGenerating}
+      >
+        续写
+      </button>
+      {quickInputEnabled ? (
+        <button
+          type="button"
+          className="story-quick-input-btn"
+          data-open={quickPanelOpen ? "true" : undefined}
+          onClick={() => setQuickPanelOpen((open) => !open)}
+          aria-expanded={quickPanelOpen}
+          aria-label={quickPanelOpen ? "收起快捷输入面板" : "展开快捷输入面板"}
+        >
+          输入
+        </button>
+      ) : null}
+      {autoReadingEnabled ? (
+        <>
+          <button
+            type="button"
+            className="story-auto-read-btn"
+            data-reading={autoReading ? "true" : undefined}
+            onClick={onToggleAutoReading}
+            disabled={!autoReading && !canAutoRead}
+            aria-label={autoReading ? "停止自动阅读" : "从最新角色消息开始自动阅读"}
+          >
+            {autoReading ? "停止" : "自动"}
+          </button>
+          <button
+            type="button"
+            className="story-current-read-btn"
+            data-expanded={currentReadExpanded ? "true" : undefined}
+            onClick={onCurrentReadControl}
+            disabled={!canAutoRead}
+            aria-label={currentReadExpanded ? "从当前位置开始自动阅读" : "展开当前位置阅读按钮"}
+            title="从当前位置开始阅读"
+          >
+            <BookOpenIcon width={14} height={14} aria-hidden="true" />
+            {currentReadExpanded ? <span>从当前位置开始阅读</span> : null}
+          </button>
+        </>
+      ) : null}
       <textarea
         ref={textareaRef}
         rows={1}
         value={draft}
-        onFocus={(event) => resizeStoryComposerTextarea(event.currentTarget)}
+        onFocus={(event) => { resizeStoryComposerTextarea(event.currentTarget); rememberSelection(event.currentTarget); }}
+        onSelect={(event) => rememberSelection(event.currentTarget)}
+        onKeyUp={(event) => rememberSelection(event.currentTarget)}
         onChange={(event) => {
           setDraft(event.target.value);
+          rememberSelection(event.currentTarget);
           resizeStoryComposerTextarea(event.currentTarget);
         }}
         onKeyDown={(event) => {
@@ -255,7 +433,7 @@ const StoryComposer = memo(function StoryComposer({
             submit();
           }
         }}
-        placeholder={`以你和“${characterName}”为主角继续这一段剧情……`}
+        placeholder="你该怎么回应"
       />
       <button
         className={`story-send-btn${isGenerating ? " is-generating" : ""}`}
@@ -273,7 +451,13 @@ const StoryComposer = memo(function StoryComposer({
 export function StoryApp({ onClose }: StoryAppProps) {
   const [ready, setReady] = useState(false);
   const [, setStorageVersion] = useState(0);
-  const [drawerOpen, setDrawerOpen] = useState(false);
+  // 公用方案仓库版本：仓库内容变化（设置页/小卷工具写入）时刷新方案相关 UI
+  const [schemeRepoVersion, setSchemeRepoVersion] = useState(0);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [floatingPhoneOpen, setFloatingPhoneOpen] = useState(false);
+  const [floatingChatDraft, setFloatingChatDraft] = useState("");
+  const [floatingChatGenerating, setFloatingChatGenerating] = useState(false);
+  const [floatingChatVersion, setFloatingChatVersion] = useState(0);
   const [activeCharacterId, setActiveCharacterId] = useState<string>("");
   const [activeSessionId, setActiveSessionId] = useState<string>("");
   const [messages, setMessages] = useState<StoryMessage[]>([]);
@@ -294,6 +478,11 @@ export function StoryApp({ onClose }: StoryAppProps) {
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [editingContent, setEditingContent] = useState("");
   const [cssModalOpen, setCssModalOpen] = useState(false);
+  const [playingVoiceSegmentId, setPlayingVoiceSegmentId] = useState<string | null>(null);
+  const [voiceNotice, setVoiceNotice] = useState<string | null>(null);
+  const [voiceSequenceProgress, setVoiceSequenceProgress] = useState({ current: 0, total: 0 });
+  const [autoReading, setAutoReading] = useState(false);
+  const [currentReadExpanded, setCurrentReadExpanded] = useState(false);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const shellInnerRef = useRef<HTMLDivElement | null>(null);
   const mountedRef = useRef(true);
@@ -301,9 +490,21 @@ export function StoryApp({ onClose }: StoryAppProps) {
   const cacheRefreshKeyRef = useRef<string | null>(null);
   const composerAppendIdRef = useRef(0);
   const loadMoreRestoreRef = useRef<{ scrollHeight: number; scrollTop: number } | null>(null);
+  // ── 设置页往返的滚动位置恢复 ──
+  // 设置页会整体卸载 story-stage（提前 return 渲染设置页），返回后是全新 DOM，
+  // scrollTop 归零表现为"一进设置再回来就跳回顶部"。这里在 onScroll 里持续记录
+  // 位置，返回时写回；设置期间切换角色或消息数量变化则放弃恢复、贴到底部。
+  const stageScrollMemoRef = useRef(0);
+  const settingsOpenSnapshotRef = useRef<{ sessionId: string; messageCount: number } | null>(null);
+  const messagesLengthRef = useRef(0);
   const longPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const longPressTriggeredRef = useRef(false);
   const startPosRef = useRef<{ x: number; y: number } | null>(null);
+  const voicePlaybackRef = useRef<{ abort: () => void } | null>(null);
+  const voiceRequestIdRef = useRef(0);
+  const voiceNoticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const voiceSequenceIndexRef = useRef(0);
+  const miniPhoneScrollRef = useRef<HTMLDivElement | null>(null);
 
   const characters = useMemo(() => loadCharacters(), []);
   const userIdentity = useMemo(
@@ -320,7 +521,45 @@ export function StoryApp({ onClose }: StoryAppProps) {
     [sessions, activeSessionId]
   );
   const uiPrefs = currentSession?.uiPrefs || {};
+  const storySettings: StoryCharacterSettings = currentSession?.settings || {};
+  // 方案定义统一来自公用仓库（所有角色共享），角色设置里只有“启用哪一个”
+  const schemeRepo: StorySchemeRepository = useMemo(
+    () => loadStorySchemeRepository(),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [schemeRepoVersion, ready],
+  );
+  const activeStatusScheme = schemeRepo.statusSchemes.find((item) => item.id === storySettings.activeStatusSchemeId)
+    ?? storySettings.statusSchemes?.find((item) => item.id === storySettings.activeStatusSchemeId);
+  const activeTheaterScheme = schemeRepo.theaterSchemes.find((item) => item.id === storySettings.activeTheaterSchemeId)
+    ?? storySettings.theaterSchemes?.find((item) => item.id === storySettings.activeTheaterSchemeId);
+  const activeStatusRenderHtml = activeStatusScheme?.renderHtml
+    ?? (["status-default", "status-html"].includes(activeStatusScheme?.id || "") ? STORY_DEFAULT_STATUS_RENDER : "");
+  const activeTheaterRenderHtml = activeTheaterScheme?.renderHtml
+    ?? (["theater-default", "theater-furry"].includes(activeTheaterScheme?.id || "") ? STORY_DEFAULT_THEATER_RENDER : "");
+  const boundPreset = useMemo(() => {
+    if (!activeCharacterId) return null;
+    const slot = resolveBinding(loadBindingConfig(), activeCharacterId, "story");
+    return (slot.presetId ? loadPresets().find((item) => item.id === slot.presetId) : null)
+      || loadPresets().find((item) => item.builtIn)
+      || null;
+  }, [activeCharacterId]);
+  const floatingChatSession = useMemo(() => {
+    if (!activeCharacterId) return null;
+    return loadChatSessions().find((item) => item.contactId === activeCharacterId && !item.isGroup) || null;
+  }, [activeCharacterId, floatingChatVersion]);
+  const floatingChatMessages = useMemo(() => floatingChatSession
+    ? loadChatMessages(floatingChatSession.id).filter((item) => item.role === "user" || item.role === "assistant").slice(-30)
+    : [], [floatingChatSession, floatingChatVersion]);
+  const floatingChatContext = useMemo(() => floatingChatMessages.map((message) => {
+    const name = message.role === "user" ? (userIdentity?.name || "用户") : (currentCharacter?.name || "角色");
+    const text = message.content.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+    return `${new Date(message.createdAt).toLocaleString()} ${name}：${text}`;
+  }).join("\n"), [currentCharacter?.name, floatingChatMessages, userIdentity?.name]);
   const isGenerating = Boolean(activeSessionId) && generatingSessionIds.has(activeSessionId);
+  const latestAssistantMessageId = useMemo(
+    () => [...messages].reverse().find((message) => message.role === "assistant")?.id || "",
+    [messages],
+  );
 
   const markGenerating = useCallback((sessionId: string, on: boolean) => {
     setGeneratingSessionIds((prev) => {
@@ -335,6 +574,9 @@ export function StoryApp({ onClose }: StoryAppProps) {
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
+      voiceRequestIdRef.current += 1;
+      voicePlaybackRef.current?.abort();
+      if (voiceNoticeTimerRef.current) clearTimeout(voiceNoticeTimerRef.current);
       if (activeSessionIdRef.current) {
         cancelStoryGenerationRun(activeSessionIdRef.current);
       }
@@ -342,8 +584,31 @@ export function StoryApp({ onClose }: StoryAppProps) {
   }, []);
 
   useEffect(() => {
+    voiceSequenceIndexRef.current = 0;
+    setVoiceSequenceProgress({ current: 0, total: 0 });
+    voiceRequestIdRef.current += 1;
+    voicePlaybackRef.current?.abort();
+    voicePlaybackRef.current = null;
+    setPlayingVoiceSegmentId(null);
+  }, [activeSessionId, latestAssistantMessageId]);
+
+  useLayoutEffect(() => {
+    if (!floatingPhoneOpen) return;
+    const node = miniPhoneScrollRef.current;
+    if (!node) return;
+    node.scrollTop = node.scrollHeight;
+  }, [floatingChatGenerating, floatingChatVersion, floatingPhoneOpen]);
+
+  useEffect(() => {
     hydrateStoryStorage().then(() => {
-      const initialChar = loadCharacters()[0]?.id || "";
+      const availableCharacters = loadCharacters();
+      const rememberedCharacterId = kvGet(STORY_ACTIVE_CHARACTER_KEY) || "";
+      const recentCharacterId = loadStorySessions()[0]?.characterId || "";
+      const initialChar = availableCharacters.some((item) => item.id === rememberedCharacterId)
+        ? rememberedCharacterId
+        : availableCharacters.some((item) => item.id === recentCharacterId)
+          ? recentCharacterId
+          : availableCharacters[0]?.id || "";
       if (initialChar) {
         const session = createOrGetStorySession(initialChar);
         setActiveCharacterId(initialChar);
@@ -352,8 +617,8 @@ export function StoryApp({ onClose }: StoryAppProps) {
         setVisibleMessageCount(STORY_INITIAL_LOAD);
         setMessages(loadStoryMessages(session.id));
         setCustomCssDraft(session.customCSS || "");
-        setFoldTagsDraft(session.foldTags ?? "think,thinking");
-        setContextExcludedTagsDraft(session.contextExcludedTags ?? "think,thinking");
+        setFoldTagsDraft(session.foldTags ?? "think,thinking,story_status,story_theater");
+        setContextExcludedTagsDraft(session.contextExcludedTags ?? "think,thinking,story_theater");
         setStorageVersion((value) => value + 1);
       }
       setReady(true);
@@ -362,16 +627,22 @@ export function StoryApp({ onClose }: StoryAppProps) {
 
   useEffect(() => {
     if (!activeCharacterId) return;
+    kvSet(STORY_ACTIVE_CHARACTER_KEY, activeCharacterId);
     const session = createOrGetStorySession(activeCharacterId);
     setActiveSessionId(session.id);
     activeSessionIdRef.current = session.id; // 同步更新，堵住生成完成回调的守卫空窗
     setVisibleMessageCount(STORY_INITIAL_LOAD);
     setMessages(loadStoryMessages(session.id));
     setCustomCssDraft(session.customCSS || "");
-    setFoldTagsDraft(session.foldTags ?? "think,thinking");
-    setContextExcludedTagsDraft(session.contextExcludedTags ?? "think,thinking");
+    setFoldTagsDraft(session.foldTags ?? "think,thinking,story_status,story_theater");
+    setContextExcludedTagsDraft(session.contextExcludedTags ?? "think,thinking,story_theater");
     setStorageVersion((value) => value + 1);
   }, [activeCharacterId]);
+
+  useEffect(() => {
+    setAutoReading(false);
+    setCurrentReadExpanded(false);
+  }, [activeSessionId]);
 
   // Listen for live CSS updates from 小卷
   useEffect(() => {
@@ -384,6 +655,28 @@ export function StoryApp({ onClose }: StoryAppProps) {
     window.addEventListener("story-session-css-updated", onCSSUpdate);
     return () => window.removeEventListener("story-session-css-updated", onCSSUpdate);
   }, [activeSessionId]);
+
+  // Listen for story tail scheme updates from 小卷 (剧情方案套件)
+  useEffect(() => {
+    const onSettingsUpdate = (e: Event) => {
+      const detail = (e as CustomEvent).detail;
+      if (detail?.sessionId && detail.sessionId === activeSessionIdRef.current) {
+        setStorageVersion((value) => value + 1);
+      }
+    };
+    window.addEventListener("story-session-settings-updated", onSettingsUpdate);
+    return () => window.removeEventListener("story-session-settings-updated", onSettingsUpdate);
+  }, []);
+
+  // 公用方案仓库变化（设置页保存/小卷工具写入/迁移）时刷新方案相关 UI
+  useEffect(() => {
+    const onRepoUpdate = () => {
+      setSchemeRepoVersion((value) => value + 1);
+      setStorageVersion((value) => value + 1);
+    };
+    window.addEventListener(STORY_SCHEME_REPO_EVENT, onRepoUpdate);
+    return () => window.removeEventListener(STORY_SCHEME_REPO_EVENT, onRepoUpdate);
+  }, []);
 
   const autoBottomLockRef = useRef(true);
   const foldToggleSuppressUntilRef = useRef(0);
@@ -456,7 +749,7 @@ export function StoryApp({ onClose }: StoryAppProps) {
       cancelAnimationFrame(frame);
       observer.disconnect();
     };
-  }, [activeSessionId, scrollStoryToBottom]);
+  }, [activeSessionId, scrollStoryToBottom, settingsOpen]);
 
   useEffect(() => {
     const node = scrollRef.current;
@@ -471,13 +764,81 @@ export function StoryApp({ onClose }: StoryAppProps) {
     };
     node.addEventListener("toggle", handleToggle, true);
     return () => node.removeEventListener("toggle", handleToggle, true);
-  }, [activeSessionId]);
+  }, [activeSessionId, settingsOpen]);
 
   const currentPreview = useMemo(() => getStoryPreview(messages), [messages]);
   const visibleMessages = useMemo(() => {
     return messages.slice(-visibleMessageCount);
   }, [messages, visibleMessageCount]);
   const hasMoreMessages = visibleMessages.length < messages.length;
+
+  const startAutoReading = useCallback((from: "latest" | "current") => {
+    const node = scrollRef.current;
+    if (!node || messages.length === 0) return;
+    autoBottomLockRef.current = false;
+
+    if (from === "latest" && latestAssistantMessageId) {
+      const escapedId = typeof CSS !== "undefined" && typeof CSS.escape === "function"
+        ? CSS.escape(latestAssistantMessageId)
+        : latestAssistantMessageId.replace(/["\\]/g, "\\$&");
+      const latest = node.querySelector<HTMLElement>(`[data-story-message-id="${escapedId}"]`);
+      if (latest) {
+        const nodeRect = node.getBoundingClientRect();
+        const latestRect = latest.getBoundingClientRect();
+        const target = node.scrollTop + latestRect.top - nodeRect.top - node.clientHeight / 2;
+        node.scrollTop = Math.max(0, Math.min(node.scrollHeight - node.clientHeight, Math.round(target)));
+      }
+    }
+
+    setCurrentReadExpanded(false);
+    requestAnimationFrame(() => setAutoReading(true));
+  }, [latestAssistantMessageId, messages.length]);
+
+  useEffect(() => {
+    if (!autoReading) return;
+    const node = scrollRef.current;
+    if (!node) {
+      setAutoReading(false);
+      return;
+    }
+
+    const speed = Math.max(12, Math.min(120, uiPrefs.autoReadingSpeed ?? DEFAULT_AUTO_READING_SPEED));
+    const previousScrollBehavior = node.style.getPropertyValue("scroll-behavior");
+    const previousScrollBehaviorPriority = node.style.getPropertyPriority("scroll-behavior");
+    // iOS PWA 会让 CSS smooth scrolling 和逐帧 scrollTop 互相抢位置。
+    node.style.setProperty("scroll-behavior", "auto", "important");
+    let frame = 0;
+    let previousTime = performance.now();
+    // Safari 会把不足 1px 的 scrollTop 写入取整；单独累计目标位置后再写整数，
+    // 慢速（默认每帧约 0.6px）也能稳定前进。
+    let desiredScrollTop = node.scrollTop;
+    const tick = (time: number) => {
+      const maxScrollTop = Math.max(0, node.scrollHeight - node.clientHeight);
+      if (desiredScrollTop >= maxScrollTop - 1) {
+        node.scrollTop = maxScrollTop;
+        setAutoReading(false);
+        return;
+      }
+      const elapsed = Math.min(64, time - previousTime);
+      previousTime = time;
+      desiredScrollTop = Math.min(maxScrollTop, desiredScrollTop + (speed * elapsed) / 1000);
+      node.scrollTop = Math.floor(desiredScrollTop);
+      frame = requestAnimationFrame(tick);
+    };
+    frame = requestAnimationFrame(tick);
+    return () => {
+      cancelAnimationFrame(frame);
+      if (previousScrollBehavior) {
+        node.style.setProperty("scroll-behavior", previousScrollBehavior, previousScrollBehaviorPriority);
+      } else {
+        node.style.removeProperty("scroll-behavior");
+      }
+    };
+  }, [autoReading, uiPrefs.autoReadingSpeed]);
+
+  useEffect(() => {
+    if (!uiPrefs.autoReadingEnabled && autoReading) setAutoReading(false);
+  }, [autoReading, uiPrefs.autoReadingEnabled]);
 
   const loadMoreMessages = useCallback(() => {
     if (!hasMoreMessages) return;
@@ -498,6 +859,82 @@ export function StoryApp({ onClose }: StoryAppProps) {
     node.scrollTop = restore.scrollTop + (node.scrollHeight - restore.scrollHeight);
     loadMoreRestoreRef.current = null;
   }, [visibleMessages.length]);
+
+  useEffect(() => {
+    messagesLengthRef.current = messages.length;
+  }, [messages.length]);
+
+  // 从剧情设置页返回：把滚动位置恢复到进设置之前停留的地方
+  useLayoutEffect(() => {
+    if (settingsOpen) {
+      settingsOpenSnapshotRef.current = {
+        sessionId: activeSessionIdRef.current,
+        messageCount: messagesLengthRef.current,
+      };
+      return;
+    }
+    const snapshot = settingsOpenSnapshotRef.current;
+    settingsOpenSnapshotRef.current = null;
+    const node = scrollRef.current;
+    if (!node || !snapshot) return;
+    const contentChanged = snapshot.sessionId !== activeSessionIdRef.current
+      || snapshot.messageCount !== messagesLengthRef.current;
+    if (contentChanged) {
+      // 设置期间切换了角色或有新消息：贴到底部看最新内容（贴底 effect 在设置
+      // 打开期间已按旧依赖跑过空转，返回时不会再触发，需要在这里补一次）
+      autoBottomLockRef.current = true;
+      scrollStoryToBottom();
+      const stickTimers = [80, 300, 800].map((delay) => window.setTimeout(() => {
+        if (autoBottomLockRef.current) scrollStoryToBottom();
+      }, delay));
+      return () => stickTimers.forEach((id) => window.clearTimeout(id));
+    }
+    const target = stageScrollMemoRef.current;
+    if (target <= 0) return;
+    autoBottomLockRef.current = false; // 恢复期间不要被贴底逻辑拽走
+    // .story-stage 的 CSS scroll-behavior:smooth 会把 scrollTop 赋值变成
+    // 平滑滚动动画（表现为"返回后看着页面从顶部一路滑下来"，很晕）。
+    // 恢复期间用内联样式强制瞬时定位，全部校正结束后再交还给 CSS。
+    node.style.scrollBehavior = "auto";
+    let done = false;
+    let cancelled = false;
+    const timers: number[] = [];
+    const restoreBehavior = () => {
+      if (done) return;
+      done = true;
+      if (node.style.scrollBehavior === "auto") node.style.scrollBehavior = "";
+    };
+    const apply = () => {
+      if (cancelled) return;
+      const max = Math.max(0, node.scrollHeight - node.clientHeight);
+      node.scrollTop = Math.min(target, max);
+    };
+    apply();
+    // iOS 上刚挂载的容器同帧写 scrollTop 偶发不生效；rAF 回调仍在首帧
+    // 绘制前执行，补写一次确保用户看到的第一帧就是目标位置
+    requestAnimationFrame(apply);
+    // 状态栏/小剧场 iframe 高度异步确定，内容高度随后会变，补几次校正；
+    // 校正期间保持瞬时定位，最后一次校正结束后才还原平滑滚动
+    [80, 300, 800].forEach((delay, index) => timers.push(window.setTimeout(() => {
+      if (cancelled) return;
+      apply();
+      if (index === 2) restoreBehavior();
+    }, delay)));
+    const cancel = () => {
+      if (cancelled) return;
+      cancelled = true;
+      timers.forEach((id) => window.clearTimeout(id));
+      restoreBehavior();
+    };
+    // 用户一动手（触摸/滚轮）就停止校正，避免和手动滚动打架
+    node.addEventListener("pointerdown", cancel, { capture: true, once: true });
+    node.addEventListener("wheel", cancel, { capture: true, once: true, passive: true });
+    return () => {
+      cancel();
+      node.removeEventListener("pointerdown", cancel, { capture: true });
+      node.removeEventListener("wheel", cancel, { capture: true });
+    };
+  }, [settingsOpen, scrollStoryToBottom]);
 
   const handleOptionSelect = useCallback((text: string) => {
     composerAppendIdRef.current += 1;
@@ -603,10 +1040,128 @@ export function StoryApp({ onClose }: StoryAppProps) {
     const next = updateStorySession(currentSession.id, updates);
     if (!next) return;
     setCustomCssDraft(next.customCSS || "");
-    setFoldTagsDraft(next.foldTags ?? "think,thinking");
-    setContextExcludedTagsDraft(next.contextExcludedTags ?? "think,thinking");
+    setFoldTagsDraft(next.foldTags ?? "think,thinking,story_status,story_theater");
+    setContextExcludedTagsDraft(next.contextExcludedTags ?? "think,thinking,story_theater");
     setStorageVersion((value) => value + 1);
   }
+
+  const showVoiceNotice = useCallback((message: string) => {
+    setVoiceNotice(message);
+    if (voiceNoticeTimerRef.current) clearTimeout(voiceNoticeTimerRef.current);
+    voiceNoticeTimerRef.current = setTimeout(() => setVoiceNotice(null), 2600);
+  }, []);
+
+  const playStoryVoice = useCallback(async (segment: StoryVoiceSegment): Promise<boolean> => {
+    if (!activeCharacterId || !segment.text.trim()) return false;
+
+    if (!uiPrefs.voiceEnabled) {
+      showVoiceNotice("请先在剧情语音中开启语音");
+      return false;
+    }
+
+    if (playingVoiceSegmentId === segment.id) {
+      voiceRequestIdRef.current += 1;
+      voicePlaybackRef.current?.abort();
+      voicePlaybackRef.current = null;
+      setPlayingVoiceSegmentId(null);
+      return false;
+    }
+
+    const voiceConfig = resolveVoiceConfig(activeCharacterId, "story");
+    if (!voiceConfig || !voiceConfig.enableTTS) {
+      showVoiceNotice("请先在配置绑定中为剧情绑定可用的语音方案");
+      return false;
+    }
+
+    unlockAudioPlayback();
+    voiceRequestIdRef.current += 1;
+    const requestId = voiceRequestIdRef.current;
+    voicePlaybackRef.current?.abort();
+    voicePlaybackRef.current = null;
+    setPlayingVoiceSegmentId(segment.id);
+
+    try {
+      const cacheKey = `${voiceConfig.id}:${voiceConfig.speechSpeed ?? 1}:${segment.text}`;
+      let blob = storyVoiceCache.get(cacheKey) || null;
+      if (!blob) {
+        blob = await synthesizeSpeech(segment.text, voiceConfig);
+        if (blob) cacheStoryVoice(cacheKey, blob);
+      }
+      if (requestId !== voiceRequestIdRef.current) return false;
+      if (!blob) throw new Error("语音服务没有返回音频");
+
+      const playback = playAudioBlobViaMediaElement(blob);
+      voicePlaybackRef.current = playback;
+      await playback.promise;
+      return requestId === voiceRequestIdRef.current;
+    } catch (error) {
+      if (requestId === voiceRequestIdRef.current) {
+        showVoiceNotice(error instanceof Error ? error.message : "语音播放失败，请检查语音配置");
+      }
+      return false;
+    } finally {
+      if (requestId === voiceRequestIdRef.current) {
+        voicePlaybackRef.current = null;
+        setPlayingVoiceSegmentId(null);
+      }
+    }
+  }, [activeCharacterId, playingVoiceSegmentId, showVoiceNotice, uiPrefs.voiceEnabled]);
+
+  const handleStoryVoicePlay = useCallback((segment: StoryVoiceSegment) => {
+    void playStoryVoice(segment);
+  }, [playStoryVoice]);
+
+  const collectStoryVoiceSegments = useCallback((): StoryVoiceSegment[] => {
+    const stage = scrollRef.current;
+    if (!stage) return [];
+    const assistantRows = Array.from(stage.querySelectorAll<HTMLElement>('.story-row[data-role="assistant"]'));
+    const latestRowWithDialogue = assistantRows.reverse().find((row) => row.querySelector("[data-story-voice-segment]"));
+    if (!latestRowWithDialogue) return [];
+    return Array.from(latestRowWithDialogue.querySelectorAll<HTMLElement>("[data-story-voice-segment]")).flatMap((element) => {
+      const id = element.dataset.storyVoiceSegment;
+      const encodedText = element.dataset.storyVoiceText;
+      if (!id || !encodedText) return [];
+      return [{
+        id,
+        text: decodeURIComponent(encodedText),
+        speaker: element.dataset.storyVoiceSpeaker
+          ? decodeURIComponent(element.dataset.storyVoiceSpeaker)
+          : undefined,
+      }];
+    });
+  }, []);
+
+  const handlePlayNextStoryVoice = useCallback(async () => {
+    if (!uiPrefs.voiceEnabled) {
+      showVoiceNotice("请先在剧情语音中开启语音");
+      return;
+    }
+    if (playingVoiceSegmentId) return;
+    const segments = collectStoryVoiceSegments();
+    if (segments.length === 0) {
+      showVoiceNotice("当前页面还没有可播放的角色对白");
+      return;
+    }
+
+    let index = voiceSequenceIndexRef.current;
+    if (index >= segments.length) {
+      const restart = window.confirm("已经播放完，是否从头开始？");
+      if (!restart) return;
+      index = 0;
+      voiceSequenceIndexRef.current = 0;
+    }
+    setVoiceSequenceProgress({ current: index + 1, total: segments.length });
+    const completed = await playStoryVoice(segments[index]);
+    if (!completed) return;
+
+    const nextIndex = index + 1;
+    if (nextIndex < segments.length) {
+      voiceSequenceIndexRef.current = nextIndex;
+      return;
+    }
+
+    voiceSequenceIndexRef.current = segments.length;
+  }, [collectStoryVoiceSegments, playStoryVoice, playingVoiceSegmentId, showVoiceNotice, uiPrefs.voiceEnabled]);
 
   async function handleSend(userTextInput: string) {
     const userText = userTextInput.trim();
@@ -632,6 +1187,8 @@ export function StoryApp({ onClose }: StoryAppProps) {
       const result = await generateStoryCompletion(characterId, historyForGeneration, {
         sessionFoldTags: currentSession?.foldTags,
         sessionContextExcludedTags: currentSession?.contextExcludedTags,
+        settings: currentSession?.settings,
+        floatingChatContext,
         signal: generationRun.controller.signal,
       });
       if (!isCurrentGeneration()) return;
@@ -681,6 +1238,73 @@ export function StoryApp({ onClose }: StoryAppProps) {
     }
   }
 
+  async function handleFloatingChatSend() {
+    const text = floatingChatDraft.trim();
+    if (!text || !activeCharacterId || floatingChatGenerating) return;
+    const storySessionId = activeSessionId;
+    const characterId = activeCharacterId;
+    const characterName = currentCharacter?.name || "角色";
+    const userName = userIdentity?.name || "用户";
+    setFloatingChatDraft("");
+    setFloatingChatGenerating(true);
+    try {
+      await hydrateChatStorage();
+      const chatSession = createOrGetSession(characterId);
+      pushChatMessage({ sessionId: chatSession.id, role: "user", content: text, origin: "story_floating_phone" });
+      setFloatingChatVersion((value) => value + 1);
+
+      const history = loadChatMessages(chatSession.id);
+      const completion = await generateChatCompletion(chatSession, history, { appTags: ["chat", "text"], appId: "chat" });
+      const rawReply = flattenCompletionResult(completion).trim();
+      if (!rawReply) throw new Error("角色没有返回可显示的聊天内容");
+      const previousState = [...history].reverse().find((item) => item.stateValues?.length)?.stateValues || [];
+      const parsed = parseAIResponse(rawReply, previousState);
+      const parts = parsed.parts.length ? parsed.parts : [{ content: rawReply }];
+      const replyLines: string[] = [];
+      parts.forEach((part, index) => {
+        const saved = pushChatMessage({
+          sessionId: chatSession.id,
+          role: "assistant",
+          content: part.content,
+          mediaType: part.mediaType,
+          mediaData: part.mediaData,
+          senderCharacterId: characterId,
+          senderName: characterName,
+          origin: "story_floating_phone",
+          statusPanel: index === 0 ? (parsed.statusPanel || undefined) : undefined,
+          innerMonologue: index === 0 ? (parsed.innerMonologue || undefined) : undefined,
+          stateValues: index === 0 && parsed.stateValues.length ? parsed.stateValues : undefined,
+          freshStateValues: index === 0 && parsed.freshStateValues.length ? parsed.freshStateValues : undefined,
+        });
+        void saved;
+        const visible = part.content.trim() || part.mediaData?.label || (part.mediaType ? `[${part.mediaType}]` : "");
+        if (visible) replyLines.push(visible);
+      });
+
+      const stamp = new Date().toLocaleString([], { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" });
+      const transcript = [
+        `【线上聊天 · ${stamp}】`,
+        `${userName}：${text}`,
+        ...replyLines.map((line) => `${characterName}：${line}`),
+      ].join("\n");
+      if (storySessionId) {
+        pushStoryMessage({ sessionId: storySessionId, role: "system", rawContent: transcript, renderedContent: transcript });
+        if (activeSessionIdRef.current === storySessionId) setMessages(loadStoryMessages(storySessionId));
+      }
+      // 这轮聊天就在悬浮小手机里完成，用户已经看过，不在剧情 APP 外保留未读红点。
+      markChatSessionRead(chatSession.id);
+      setFloatingChatVersion((value) => value + 1);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "悬浮聊天发送失败";
+      const chatSession = loadChatSessions().find((item) => item.contactId === characterId && !item.isGroup);
+      if (chatSession) pushChatMessage({ sessionId: chatSession.id, role: "system", content: `⚠️ ${message}` });
+      setFloatingChatVersion((value) => value + 1);
+      showVoiceNotice(message);
+    } finally {
+      setFloatingChatGenerating(false);
+    }
+  }
+
   function handleStopGeneration() {
     if (!activeSessionId) return;
     const cancelled = cancelStoryGenerationRun(activeSessionId);
@@ -702,14 +1326,10 @@ export function StoryApp({ onClose }: StoryAppProps) {
     const dragStartX = dragStartXRef.current;
     const dragDeltaX = dragDeltaXRef.current;
     if (dragStartX == null) return;
-    // 从右边缘向左滑打开
+    // 从右边缘向左滑进入完整剧情设置页
     const screenW = typeof window !== "undefined" ? window.innerWidth : 400;
-    if (!drawerOpen && dragStartX > screenW - 32 && dragDeltaX < -54) {
-      setDrawerOpen(true);
-    }
-    // 向右滑关闭
-    if (drawerOpen && dragDeltaX > 54) {
-      setDrawerOpen(false);
+    if (dragStartX > screenW - 32 && dragDeltaX < -54) {
+      setSettingsOpen(true);
     }
     dragStartXRef.current = null;
     dragDeltaXRef.current = 0;
@@ -728,6 +1348,8 @@ export function StoryApp({ onClose }: StoryAppProps) {
 
   function handleMsgPointerDown(e: React.PointerEvent, msgId: string) {
     if (e.pointerType === "mouse" && e.button !== 0) return;
+    const target = e.target as HTMLElement;
+    if (target.closest("button,a,input,textarea,select,summary,iframe,[data-action],[data-story-interactive]")) return;
     // Don't preventDefault — it blocks clicks on <details>, <summary>, <input> etc. inside messages
     startPosRef.current = { x: e.clientX, y: e.clientY };
     longPressTriggeredRef.current = false;
@@ -839,6 +1461,8 @@ export function StoryApp({ onClose }: StoryAppProps) {
       const result = await generateStoryCompletion(characterId, contextMessages, {
         sessionFoldTags: currentSession?.foldTags,
         sessionContextExcludedTags: currentSession?.contextExcludedTags,
+        settings: currentSession?.settings,
+        floatingChatContext,
         signal: generationRun.controller.signal,
       });
       if (!isCurrentGeneration()) return;
@@ -862,6 +1486,12 @@ export function StoryApp({ onClose }: StoryAppProps) {
     }
   }
 
+  // 快捷输入面板：选项与光标位置来自公用仓库中当前角色选中的方案；选项全空时回落默认符号
+  const activeQuickInputScheme = resolveActiveQuickInputScheme(uiPrefs, schemeRepo);
+  const quickInputOptionsRaw = activeQuickInputScheme.options.filter((item) => item.trim());
+  const quickInputOptions = quickInputOptionsRaw.length > 0 ? quickInputOptionsRaw : STORY_DEFAULT_QUICK_INPUT_OPTIONS;
+  const quickInputCursor = activeQuickInputScheme.cursor ?? "middle";
+
   if (!ready) return null;
 
   if (characters.length === 0) {
@@ -876,7 +1506,7 @@ export function StoryApp({ onClose }: StoryAppProps) {
                   <SolidBackIcon size={16} />
                 </button>
               </div>
-              <div className="story-header-center">Story</div>
+              <div className="story-header-center" />
               <div className="story-header-right" />
             </div>
           </div>
@@ -904,6 +1534,48 @@ export function StoryApp({ onClose }: StoryAppProps) {
 
   const sessionScope = `.story-session-${currentSession.id}`;
 
+  if (settingsOpen) {
+    return (
+      <div className={`story-app-shell story-session-${currentSession.id}`} data-story-theme={uiPrefs.theme || "paper"}>
+        <StorySettingsPage
+          characters={characters}
+          activeCharacterId={activeCharacterId}
+          userName={userIdentity?.name || "用户"}
+          uiPrefs={uiPrefs}
+          settings={storySettings}
+          schemeRepo={schemeRepo}
+          boundPreset={boundPreset}
+          foldTags={foldTagsDraft}
+          contextExcludedTags={contextExcludedTagsDraft}
+          onClose={() => setSettingsOpen(false)}
+          onCharacterChange={setActiveCharacterId}
+          onUiPrefsChange={(next) => applySessionUpdates({ uiPrefs: next })}
+          onSettingsChange={(next) => applySessionUpdates({ settings: next })}
+          onSchemeRepoChange={saveStorySchemeRepository}
+          onTagsChange={(foldTags, contextExcludedTags) => {
+            setFoldTagsDraft(foldTags);
+            setContextExcludedTagsDraft(contextExcludedTags);
+            applySessionUpdates({ foldTags: foldTags.trim() || undefined, contextExcludedTags: contextExcludedTags.trim() || undefined });
+          }}
+          onOpenCss={() => {
+            setSettingsOpen(false);
+            setCssModalOpen(true);
+          }}
+          onRebuildCache={() => {
+            try {
+              const rebuilt = rebuildStorySessionRenderCache(activeCharacterId, currentSession.id, { sessionFoldTags: currentSession.foldTags });
+              setMessages(rebuilt);
+              setStorageVersion((value) => value + 1);
+              alert(`缓存重建完成，${rebuilt.length} 条消息已更新`);
+            } catch (error) {
+              alert(error instanceof Error ? error.message : "缓存重建失败，请检查 API 绑定配置");
+            }
+          }}
+        />
+      </div>
+    );
+  }
+
   return (
     <div
       className={`story-app-shell story-session-${currentSession.id}`}
@@ -919,101 +1591,10 @@ export function StoryApp({ onClose }: StoryAppProps) {
       onMouseLeave={handleTouchEnd}
     >
       {/* Styles moved to styles/story.css */}
+      {uiPrefs.wallpaper ? <div className="story-wallpaper-layer" style={{ backgroundImage: `url(${uiPrefs.wallpaper})` }} /> : null}
       {currentSession.customCSS ? (
         <SessionCustomCSS css={currentSession.customCSS} scope={sessionScope} />
       ) : null}
-
-      {drawerOpen ? <div className="story-drawer-overlay" onClick={() => setDrawerOpen(false)} /> : null}
-      <aside className="story-drawer" style={{ transform: drawerOpen ? "translateX(0)" : "translateX(106%)", transition: "transform 220ms ease" }}>
-        <div className="story-drawer-section">
-          <div className="story-drawer-eyebrow">剧情角色</div>
-          <div className="story-character-list">
-            {characters.map((character) => (
-              <button
-                key={character.id}
-                className="story-character-chip"
-                data-active={character.id === activeCharacterId ? "true" : undefined}
-                onClick={() => {
-                  setActiveCharacterId(character.id);
-                  setDrawerOpen(false);
-                }}
-              >
-                <Avatar src={character.avatar || undefined} name={character.name} size="lg" />
-                <span className="story-character-name">{character.name}</span>
-              </button>
-            ))}
-          </div>
-        </div>
-
-        <div className="story-drawer-section">
-          <div className="story-drawer-eyebrow">显示选项</div>
-          <div style={{ padding: "10px 0", borderBottom: "1px solid var(--c-story-drawer-border, rgba(124, 104, 68, 0.08))" }}>
-            <label style={{ fontSize: "calc(13px*var(--app-text-scale,1))", color: "var(--c-story-sub, rgba(95, 82, 61, 0.72))", display: "block", marginBottom: 6 }}>
-              折叠标签
-            </label>
-            <input
-              type="text"
-              value={foldTagsDraft}
-              onChange={(e) => setFoldTagsDraft(e.target.value)}
-              onBlur={() => applySessionUpdates({ foldTags: foldTagsDraft.trim() || undefined })}
-              placeholder="think,thinking"
-              style={{
-                width: "100%", boxSizing: "border-box",
-                padding: "8px 12px", borderRadius: 0,
-                border: "none", boxShadow: "inset 0 1px 3px rgba(0,0,0,0.06)",
-                background: "var(--c-story-css-box-bg, rgba(255, 251, 246, 0.88))",
-                color: "var(--c-story-text, #4b4335)",
-                fontSize: "calc(13px*var(--app-text-scale,1))", lineHeight: 1.6, fontFamily: "inherit",
-              }}
-            />
-            <div style={{ fontSize: "calc(11px*var(--app-text-scale,1))", marginTop: 4, color: "var(--c-story-sub, rgba(95, 82, 61, 0.72))" }}>
-              逗号分隔标签名，如 think,thinking,reasoning
-            </div>
-          </div>
-          <div style={{ padding: "10px 0", borderBottom: "1px solid var(--c-story-drawer-border, rgba(124, 104, 68, 0.08))" }}>
-            <label style={{ fontSize: "calc(13px*var(--app-text-scale,1))", color: "var(--c-story-sub, rgba(95, 82, 61, 0.72))", display: "block", marginBottom: 6 }}>
-              不进上下文标签
-            </label>
-            <input
-              type="text"
-              value={contextExcludedTagsDraft}
-              onChange={(e) => setContextExcludedTagsDraft(e.target.value)}
-              onBlur={() => applySessionUpdates({ contextExcludedTags: contextExcludedTagsDraft.trim() || undefined })}
-              placeholder="think,thinking"
-              style={{
-                width: "100%", boxSizing: "border-box",
-                padding: "8px 12px", borderRadius: 0,
-                border: "none", boxShadow: "inset 0 1px 3px rgba(0,0,0,0.06)",
-                background: "var(--c-story-css-box-bg, rgba(255, 251, 246, 0.88))",
-                color: "var(--c-story-text, #4b4335)",
-                fontSize: "calc(13px*var(--app-text-scale,1))", lineHeight: 1.6, fontFamily: "inherit",
-              }}
-            />
-            <div style={{ fontSize: "calc(11px*var(--app-text-scale,1))", marginTop: 4, color: "var(--c-story-sub, rgba(95, 82, 61, 0.72))" }}>
-              默认 think,thinking；影响后续生成上下文，不影响显示与保存
-            </div>
-          </div>
-        </div>
-
-        <div className="story-drawer-section">
-          <div className="story-drawer-eyebrow">工具</div>
-          <button
-            className="story-tool-btn"
-            onClick={() => {
-              try {
-                const rebuilt = rebuildStorySessionRenderCache(activeCharacterId, currentSession.id, { sessionFoldTags: currentSession.foldTags });
-                setMessages(rebuilt);
-                setStorageVersion((value) => value + 1);
-                alert(`缓存重建完成，${rebuilt.length} 条消息已更新`);
-              } catch (error) {
-                alert(error instanceof Error ? error.message : "缓存重建失败，请检查 API 绑定配置");
-              }
-            }}
-          >
-            重建渲染缓存
-          </button>
-        </div>
-      </aside>
 
       <div className="story-shell-inner" ref={shellInnerRef}>
 
@@ -1025,13 +1606,17 @@ export function StoryApp({ onClose }: StoryAppProps) {
               <button className="story-top-btn" onClick={onClose} aria-label="关闭剧情模式">
                 <SolidBackIcon size={16} />
               </button>
+              <div className="story-header-person">
+                <Avatar src={currentCharacter.avatar || undefined} name={currentCharacter.name} size="sm" />
+                <span>{currentCharacter.name}</span>
+              </div>
             </div>
-            <div className="story-header-center">Story</div>
+            <div className="story-header-center" />
             <div className="story-header-right" style={{ gap: 8 }}>
               <button className="story-top-btn" onClick={() => setCssModalOpen(true)} aria-label="页面样式">
                 <PaintBrushIcon width={16} height={16} />
               </button>
-              <button className="story-top-btn" onClick={() => setDrawerOpen(true)} aria-label="打开剧情侧栏">
+              <button className="story-top-btn" onClick={() => setSettingsOpen(true)} aria-label="打开剧情设置">
                 <SolidMenuIcon size={16} />
               </button>
             </div>
@@ -1043,6 +1628,7 @@ export function StoryApp({ onClose }: StoryAppProps) {
           ref={scrollRef}
           onScroll={(event) => {
             const node = event.currentTarget;
+            stageScrollMemoRef.current = node.scrollTop; // 持续记录，供设置页返回时恢复
             if (performance.now() < foldToggleSuppressUntilRef.current) return;
             const distanceFromBottom = node.scrollHeight - node.scrollTop - node.clientHeight;
             autoBottomLockRef.current = distanceFromBottom <= 12;
@@ -1115,6 +1701,7 @@ export function StoryApp({ onClose }: StoryAppProps) {
                       key={message.id}
                       className="story-row"
                       data-role={message.role}
+                      data-story-message-id={message.id}
                       onPointerDown={(e) => handleMsgPointerDown(e, message.id)}
                       onPointerMove={handleMsgPointerMove}
                       onPointerUp={handleMsgPointerUp}
@@ -1166,6 +1753,10 @@ export function StoryApp({ onClose }: StoryAppProps) {
                               content={message.renderedContent || message.rawContent}
                               messageId={message.id}
                               onOptionSelect={handleOptionSelect}
+                              onVoicePlay={message.role === "assistant" ? handleStoryVoicePlay : undefined}
+                              playingVoiceSegmentId={playingVoiceSegmentId}
+                              statusRenderHtml={activeStatusRenderHtml}
+                              theaterRenderHtml={activeTheaterRenderHtml}
                               serifIframeFallback
                             />
                           )}
@@ -1209,13 +1800,74 @@ export function StoryApp({ onClose }: StoryAppProps) {
         </div>
       </div>
 
+      {voiceNotice ? (
+        <div className="story-voice-notice" role="status">{voiceNotice}</div>
+      ) : null}
+
       <StoryComposer
-        characterName={currentCharacter.name}
         isGenerating={isGenerating}
         appendRequest={composerAppendRequest}
+        voiceEnabled={Boolean(uiPrefs.voiceEnabled)}
+        voicePlaying={Boolean(playingVoiceSegmentId)}
+        voiceProgress={voiceSequenceProgress}
         onSend={(text) => { void handleSend(text); }}
+        onContinue={() => { void handleSend("继续"); }}
+        autoReadingEnabled={Boolean(uiPrefs.autoReadingEnabled)}
+        autoReading={autoReading}
+        currentReadExpanded={currentReadExpanded}
+        canAutoRead={messages.length > 0}
+        onToggleAutoReading={() => {
+          if (autoReading) setAutoReading(false);
+          else startAutoReading("latest");
+        }}
+        onCurrentReadControl={() => {
+          if (!currentReadExpanded) setCurrentReadExpanded(true);
+          else startAutoReading("current");
+        }}
         onStop={handleStopGeneration}
+        onPlayNext={() => { void handlePlayNextStoryVoice(); }}
+        quickInputEnabled={Boolean(uiPrefs.quickInputEnabled)}
+        quickInputOptions={quickInputOptions}
+        quickInputCursor={quickInputCursor}
       />
+
+      {storySettings.floatingPhoneEnabled ? (
+        <button className="story-floating-phone-ball" type="button" onClick={() => { setFloatingChatVersion((value) => value + 1); setFloatingPhoneOpen(true); }} aria-label="打开悬浮小手机"><MiniPhoneIcon size={18} /></button>
+      ) : null}
+      {floatingPhoneOpen ? (
+        <div className="story-mini-phone-overlay" onClick={() => setFloatingPhoneOpen(false)}>
+          <section className="story-mini-phone" onClick={(event) => event.stopPropagation()}>
+            <header><button type="button" onClick={() => setFloatingPhoneOpen(false)}><XMarkIcon width={15} /></button><div><Avatar src={currentCharacter.avatar || undefined} name={currentCharacter.name} size="sm" /><strong>{currentCharacter.name}</strong></div><span /></header>
+            <div className="story-mini-phone-messages" ref={miniPhoneScrollRef}>
+              {floatingChatMessages.length ? floatingChatMessages.map((message) => (
+                <div key={message.id} data-role={message.role}>
+                  <small>{message.role === "user" ? (userIdentity?.name || "我") : currentCharacter.name} · {new Date(message.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</small>
+                  <p>{message.content || message.mediaData?.label || (message.mediaType ? `[${message.mediaType}]` : "")}</p>
+                </div>
+              )) : <p className="story-mini-phone-empty">还没有与该角色的线上聊天记录</p>}
+              {floatingChatGenerating ? <div className="story-mini-phone-typing"><i /><i /><i /></div> : null}
+            </div>
+            <div className="story-mini-phone-composer">
+              <textarea
+                rows={1}
+                value={floatingChatDraft}
+                onChange={(event) => setFloatingChatDraft(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && !event.shiftKey) {
+                    event.preventDefault();
+                    void handleFloatingChatSend();
+                  }
+                }}
+                placeholder="发消息…"
+                disabled={floatingChatGenerating}
+              />
+              <button type="button" onClick={() => { void handleFloatingChatSend(); }} disabled={!floatingChatDraft.trim() || floatingChatGenerating} aria-label="发送消息">
+                {floatingChatGenerating ? <span>···</span> : <PaperAirplaneIcon width={14} />}
+              </button>
+            </div>
+          </section>
+        </div>
+      ) : null}
 
       {/* CSS Style Modal */}
       {cssModalOpen && (
